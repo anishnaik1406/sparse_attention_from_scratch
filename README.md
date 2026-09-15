@@ -1,0 +1,141 @@
+# Sparse Attention from Scratch
+
+Task 1 of the Postman AI/ML recruitment task. Dense attention written out by
+hand, three sparsity patterns built on a block-gather kernel that never
+materialises the `[N, N]` score matrix, a correctness harness that checks the
+sparse path against the dense one exactly, a benchmark showing the O(N) vs
+O(N²) split, and a small char-level GPT to see what each pattern costs in loss.
+
+No `F.scaled_dot_product_attention` anywhere except in the benchmark, where it
+appears only as a labelled speed reference.
+
+## Setup
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt          # torch, matplotlib
+```
+
+CPU is enough for everything here. A free Colab T4 makes the 1.6 training run
+take minutes instead of tens of minutes.
+
+## Run
+
+```bash
+python tests/test_correctness.py         # 1.3 / 1.4  pass-fail table
+python experiments/nan_demo.py           # 1.4        the NaN, shown not asserted
+python experiments/plot_patterns.py      # 1.2        mask pictures + density scaling
+python benchmarks/benchmark.py           # 1.5        time + memory, 512 -> 8192
+python experiments/train_char_gpt.py --context 256 --attn-block 16 --steps 2000  # 1.6
+bash run_all.sh                          # all of the above
+```
+
+Useful flags:
+
+```bash
+python benchmarks/benchmark.py --device cuda --heads 8 --lengths 512,1024,2048,4096,8192
+python benchmarks/benchmark.py --mem-budget-gb 6      # how big dense is allowed to get
+python experiments/train_char_gpt.py --patterns dense,sliding_window,mixed --sample
+```
+
+`results/` gets the CSVs and `results/hardware.json`; `plots/` gets the figures.
+
+## Repository layout
+
+```
+src/dense_attention.py     1.1  manual dense attention + the safe masked softmax (1.4)
+src/patterns.py            1.2  sliding window, BigBird-style, dilated (stretch), dense
+src/sparse_attention.py    1.2  block-gather sparse kernel, plan builder, nn.Module
+src/model.py               1.6  2-layer char GPT
+tests/test_correctness.py  1.3  17 checks, sparse vs dense under an identical mask
+benchmarks/benchmark.py    1.5  wall-clock + peak memory sweep, hardware reported
+experiments/nan_demo.py    1.4  side-by-side naive vs safe softmax
+experiments/plot_patterns.py    mask visualisation, density vs sequence length
+experiments/train_char_gpt.py   1.6  one training run per pattern, held-out loss
+WRITEUP.md                 1.7  what each pattern loses, and why
+```
+
+## Deliverable map
+
+| Item | Where | Status |
+|---|---|---|
+| 1.1 manual dense attention | `src/dense_attention.py::dense_attention` | done |
+| 1.2 two sparsity patterns | `src/patterns.py` — sliding window, BigBird (local+global+random) | done, plus a third (dilated) |
+| 1.3 correctness harness | `tests/test_correctness.py` | done, 17/17 |
+| 1.4 NaN handling | `src/dense_attention.py::masked_softmax`, `experiments/nan_demo.py` | done |
+| 1.5 benchmark 512→8192 | `benchmarks/benchmark.py`, `plots/benchmark_*.png` | done |
+| 1.6 char-GPT quality eval | `experiments/train_char_gpt.py`, `results/quality.csv` | done |
+| 1.7 writeup | `WRITEUP.md` | done |
+| stretch: third pattern | `dilated_block_mask` | done |
+| stretch: per-head mixing | `SparseSelfAttention(head_patterns=[...])`, `--patterns mixed` | done |
+
+## How the sparse kernel works
+
+Patterns are defined at *block* granularity: a `[nb, nb]` boolean saying which
+key blocks each query block may read. Token-level structure (causality inside
+the diagonal block, padding) is applied afterwards on a much smaller tensor.
+
+Block granularity is the point. A token-granular mask saves no work — you still
+compute every score before zeroing it. Coarse structure is what lets whole tiles
+be skipped, which is the same reason FlashAttention skips fully-masked causal
+tiles.
+
+`build_plan` turns the block mask into a gather plan: for each query block, the
+list of allowed key blocks, padded to a common length `kmax`, plus a fine mask
+that kills the padding slots and enforces causality. The forward pass then
+gathers K and V and computes a score tensor of shape
+
+```
+[B, H, nb, block, kmax * block]      instead of      [B, H, N, N]
+```
+
+`kmax` stays roughly constant as N grows for all three sparse patterns, so cost
+is linear in N.
+
+`plan_token_mask` reconstructs the equivalent `[N, N]` mask. It is used only by
+the correctness harness, so "sparse matches dense" is an exact statement about
+the same mathematical object rather than a similarity check.
+
+## Results at a glance
+
+Benchmark (CPU, 1 thread, B=1 H=2 D=64, block 64, forward only — relative
+numbers, see `results/hardware.json`):
+
+| N | dense | sliding window | bigbird | dilated |
+|---:|---:|---:|---:|---:|
+| 512 | 12.1 ms | 4.4 ms | 8.5 ms | 8.8 ms |
+| 1024 | 47.6 ms | 5.6 ms | 19.3 ms | 15.3 ms |
+| 2048 | 218.6 ms | 15.6 ms | 34.4 ms | 26.4 ms |
+| 4096 | 935.9 ms | 37.3 ms | 75.0 ms | 57.0 ms |
+| 8192 | skipped (0.54 GB of scores) | 80.4 ms | 160.1 ms | 127.0 ms |
+
+Dense ×4.0 per doubling, sparse ×2.0. Quality (2-layer char GPT, context 256,
+400 steps, single seed) is in `results/quality.csv`; every sparse pattern beat
+dense on val loss, which is explained rather than claimed as a win in
+`WRITEUP.md` §5.
+
+## Reading the numbers
+
+* **Timings are relative.** Compare sparse against dense from the same run on
+  the same machine. `results/hardware.json` records what that machine was.
+* **On CUDA**, peak memory comes from `torch.cuda.max_memory_allocated` and is
+  exact. **On CPU** it is a sampled RSS delta and is noisy — it occasionally
+  reads 0 when the allocator reuses pages. The `score_elems` column is the
+  hardware-independent version of the same claim: the number of attention-score
+  entries actually materialised.
+* Dense is skipped, not silently dropped, once its score matrix alone exceeds
+  `--mem-budget-gb`. That skip is a result: it is the sequence length where
+  dense stops fitting.
+
+## Known limitations
+
+* Forward pass only for the benchmark, as specified. The kernel is
+  autograd-differentiable (the harness checks gradients are finite) but there
+  is no hand-written backward.
+* The gather materialises K/V blocks, so it is memory-lighter than dense but
+  heavier than a fused kernel that streams tiles from HBM. That is task 4's
+  problem, not this one.
+* `seq_len` must be a multiple of `block_size`; `build_plan(..., key_valid=)`
+  handles the padded case and the harness covers it (check F).
+* Random blocks in the BigBird pattern are drawn once from a fixed seed rather
+  than resampled per layer, so the pattern is reproducible and testable.
