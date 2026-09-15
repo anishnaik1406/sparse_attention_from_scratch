@@ -1,6 +1,7 @@
 Built with AI assistance, which the task brief permits. All experiments in
 `results/` were run by me on a Colab T4, and the numbers in this README and
 in WRITEUP.md come from those runs.
+The commit history here is short: the implementation was developed with AI assistance in a single session and committed in stages as results came in, rather than incrementally over two weeks.
 # Sparse Attention from Scratch
 
 Task 1 of the Postman AI/ML recruitment task. Dense attention written out by
