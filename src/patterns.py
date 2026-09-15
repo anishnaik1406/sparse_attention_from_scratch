@@ -161,7 +161,7 @@ def build_block_mask(name: str, n_blocks: int, causal: bool = True, **kw):
 def density(block_mask: torch.Tensor, causal: bool = True) -> float:
     """Fraction of the *causally reachable* score matrix that survives."""
     nb = block_mask.shape[0]
-    ref = torch.ones(nb, nb, dtype=torch.bool)
+    ref = torch.ones(nb, nb, dtype=torch.bool, device=block_mask.device)
     if causal:
         ref = ref.tril()
     return (block_mask & ref).sum().item() / ref.sum().item()

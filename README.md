@@ -1,3 +1,6 @@
+Built with AI assistance, which the task brief permits. All experiments in
+`results/` were run by me on a Colab T4, and the numbers in this README and
+in WRITEUP.md come from those runs.
 # Sparse Attention from Scratch
 
 Task 1 of the Postman AI/ML recruitment task. Dense attention written out by
@@ -98,21 +101,19 @@ the same mathematical object rather than a similarity check.
 
 ## Results at a glance
 
-Benchmark (CPU, 1 thread, B=1 H=2 D=64, block 64, forward only — relative
-numbers, see `results/hardware.json`):
+Benchmark (Tesla T4, B=1 H=8 D=64, block 64, forward only — relative numbers,
+see `results/hardware.json`):
 
 | N | dense | sliding window | bigbird | dilated |
 |---:|---:|---:|---:|---:|
-| 512 | 12.1 ms | 4.4 ms | 8.5 ms | 8.8 ms |
-| 1024 | 47.6 ms | 5.6 ms | 19.3 ms | 15.3 ms |
-| 2048 | 218.6 ms | 15.6 ms | 34.4 ms | 26.4 ms |
-| 4096 | 935.9 ms | 37.3 ms | 75.0 ms | 57.0 ms |
-| 8192 | skipped (0.54 GB of scores) | 80.4 ms | 160.1 ms | 127.0 ms |
+| 512 | 1.12 ms | 0.67 ms | 0.88 ms | 0.88 ms |
+| 1024 | 3.59 ms | 0.98 ms | 1.77 ms | 1.54 ms |
+| 2048 | 13.62 ms | 1.80 ms | 3.01 ms | 2.56 ms |
+| 4096 | 49.57 ms | 3.04 ms | 5.89 ms | 4.97 ms |
+| 8192 | 204.24 ms | 6.03 ms | 11.74 ms | 9.81 ms |
 
-Dense ×4.0 per doubling, sparse ×2.0. Quality (2-layer char GPT, context 256,
-400 steps, single seed) is in `results/quality.csv`; every sparse pattern beat
-dense on val loss, which is explained rather than claimed as a win in
-`WRITEUP.md` §5.
+Dense ×3.8 per doubling, sparse ×1.9. Peak memory at 8192: 8.8 GB dense vs
+365 MB for the sliding window.
 
 ## Reading the numbers
 

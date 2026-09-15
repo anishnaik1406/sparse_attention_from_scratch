@@ -113,40 +113,50 @@ seen from the correctness side rather than the performance side.
 
 ## 4. Cost: benchmark (1.5)
 
-Hardware for the numbers below (`results/hardware.json`): single-core
-Intel Xeon @ 2.10 GHz, 1 thread, PyTorch 2.14, CPU, float32, B=1, H=2, D=64,
-block size 64, forward pass only, median of 3 timed reps after warmup.
-**These are relative numbers on a deliberately slow machine** — the shapes of
-the curves are the result, not the milliseconds. Rerun on a T4 with
-`--device cuda --heads 8` before quoting anything.
+Hardware (`results/hardware.json`): Tesla T4, 15.6 GB, driver 580.82.07,
+PyTorch 2.11 + CUDA 12.8, float32, B=1, H=8, D=64, block size 64, forward pass
+only, median of 5 timed reps after warmup. Peak memory is
+`torch.cuda.max_memory_allocated`, so these are exact allocator numbers rather
+than the sampled RSS proxy the CPU path falls back to.
 
 | N | dense | sliding window | bigbird | dilated |
 |---:|---:|---:|---:|---:|
-| 512 | 12.1 ms | 4.4 ms (2.8×) | 8.5 ms (1.4×) | 8.8 ms (1.4×) |
-| 1024 | 47.6 ms | 5.6 ms (8.5×) | 19.3 ms (2.5×) | 15.3 ms (3.1×) |
-| 2048 | 218.6 ms | 15.6 ms (14.1×) | 34.4 ms (6.4×) | 26.4 ms (8.3×) |
-| 4096 | 935.9 ms | 37.3 ms (25.1×) | 75.0 ms (12.5×) | 57.0 ms (16.4×) |
-| 8192 | skipped (score matrix alone = 0.54 GB) | 80.4 ms | 160.1 ms | 127.0 ms |
+| 512 | 1.12 ms | 0.67 ms (1.7×) | 0.88 ms (1.3×) | 0.88 ms (1.3×) |
+| 1024 | 3.59 ms | 0.98 ms (3.7×) | 1.77 ms (2.0×) | 1.54 ms (2.3×) |
+| 2048 | 13.62 ms | 1.80 ms (7.6×) | 3.01 ms (4.5×) | 2.56 ms (5.3×) |
+| 4096 | 49.57 ms | 3.04 ms (16.3×) | 5.89 ms (8.4×) | 4.97 ms (10.0×) |
+| 8192 | 204.24 ms | 6.03 ms (33.9×) | 11.74 ms (17.4×) | 9.81 ms (20.8×) |
 
-Dense multiplies by ≈4.0 per doubling (12.1 → 47.6 → 218.6 → 935.9); every
-sparse pattern multiplies by ≈2.0 once N ≥ 1024 (sliding window
-15.6 → 37.3 → 80.4). That is the O(N²) vs O(N) split, measured rather than
-asserted.
+Dense multiplies by ≈3.8 per doubling (1.12 → 3.59 → 13.62 → 49.57 → 204.24);
+sliding window multiplies by ≈1.9 once N ≥ 1024 (0.98 → 1.80 → 3.04 → 6.03).
+That is the O(N²) vs O(N) split, measured rather than asserted, and the gap
+compounds: 1.7× at 512 becomes 34× at 8192.
 
-Materialised score entries, which is the hardware-independent version of the
-memory claim: dense grows as `B·H·N²` (67 M entries at N=8192, B=1, H=2),
-sliding window as `B·H·N·kmax·block` (3.1 M at the same point, 21× fewer).
-Measured peak memory tracks this on CUDA exactly; on CPU it is a sampled RSS
-delta and is noisy, which is why both columns are in the CSV.
+Peak memory shows the same split more starkly, because there is no constant
+overhead hiding in it:
 
-**Where sparse does not win.** At N=512 the sliding window is only 2.8× faster
-and BigBird only 1.4×, because at that size the dense matmul is one large,
+| N | dense | sliding window | ratio |
+|---:|---:|---:|---:|
+| 512 | 45.8 MB | 31.7 MB | 1.4× |
+| 1024 | 151.3 MB | 53.0 MB | 2.9× |
+| 2048 | 566.8 MB | 97.5 MB | 5.8× |
+| 4096 | 2215.5 MB | 186.4 MB | 11.9× |
+| 8192 | 8784.6 MB | 365.2 MB | 24.1× |
+
+Dense at 8192 needs 8.8 GB for a single forward pass at batch 1. It fits on a
+T4's 15.6 GB, but only just, and one more doubling would not. The sliding
+window needs 365 MB for the same computation. Materialised score entries, the
+hardware-independent version of the same claim, are 537 M for dense against
+12.6 M for the window — a 43× reduction that the 24× memory ratio understates
+because Q, K and V themselves are a fixed cost both paths pay.
+
+**Where sparse does not win.** At N=512 the sliding window is only 1.7× faster
+and BigBird only 1.3×, because at that size the dense matmul is one large,
 BLAS-friendly, compute-bound operation while the sparse path spends its time on
 a gather (memory-bound, no arithmetic) and on applying a fine mask whose tensor
-is a substantial fraction of the score tensor it is masking. The crossover
-where structure beats raw matmul efficiency is around N ≈ 1024 here. That
-ordering — dense wins at short context, sparse wins at long — is the honest
-summary, and it is why nobody sparsifies a 512-token model.
+is a substantial fraction of the score tensor it is masking. On a GPU this is
+more pronounced than on CPU: 512×512 attention barely occupies a T4, so the
+sparse version is saving work the hardware had spare anyway.
 
 BigBird is consistently ~2× slower than the sliding window at equal N despite
 being only ~1.7× denser. The extra cost is the gather: its allowed blocks are
@@ -164,53 +174,42 @@ essentially task 4.
 ## 5. Quality: what each pattern costs in loss (1.6)
 
 Setup: 2-layer character-level GPT on TinyShakespeare, d_model 128, 4 heads,
-context 256, attention block 16 (so 16 blocks), 437 K parameters, batch 8,
-400 steps, AdamW with OneCycle, dropout 0.1. Every condition uses the same
-seed, the same initial weights and the same batch order; the *only* difference
-is the block mask. `mixed` is the per-head stretch goal: two window heads, one
-BigBird head, one dilated head.
+context 256, attention block 16 (so 16 blocks), 437 K parameters, batch 32,
+2000 steps, AdamW with OneCycle, dropout 0.1, on a Colab T4. Every condition
+uses the same seed, the same initial weights and the same batch order; the
+*only* difference is the block mask.
 
 | pattern | density | val loss (nats/char) | val bpc | Δ vs dense | train min |
 |---|---:|---:|---:|---:|---:|
-| dense | 1.000 | 2.4358 | 3.5141 | +0.0000 | 2.09 |
-| sliding_window | 0.331 | 2.3846 | 3.4402 | **−0.0512** | 0.74 |
-| bigbird | 0.522 | 2.3975 | 3.4589 | −0.0383 | 1.01 |
-| dilated | 0.493 | 2.4226 | 3.4950 | −0.0132 | 0.96 |
-| mixed (per-head) | 0.522 | 2.3905 | 3.4487 | −0.0453 | 0.94 |
+| dense | 1.000 | 1.6494 | 2.3796 | +0.0000 | 1.88 |
+| sliding_window | 0.331 | 1.6058 | 2.3167 | **−0.0436** | 0.70 |
+| bigbird | 0.522 | 1.6258 | 2.3456 | −0.0236 | 0.99 |
+| dilated | 0.493 | 1.6259 | 2.3457 | −0.0235 | 0.90 |
 
-**Every sparse pattern beat dense.** That is the opposite of the expected
-result and it needs explaining rather than celebrating.
+**Every sparse pattern beat dense**, and the effect survived a 5× increase in
+training budget — an earlier 400-step run showed the same ordering with the
+same rough spread. That rules out the first explanation I reached for, which
+was that dense simply hadn't had time to learn what the window mask hard-codes.
 
-It is not extra capacity — parameter counts are identical to the digit, and
-sparsity strictly removes paths. Three things are going on:
+It is not extra capacity: parameter counts are identical to the digit, and
+sparsity strictly removes attention paths. What is left is regularisation.
+Removing 67 % of the attention edges is a strong structural constraint on a
+437 K-parameter model, and val loss is what improved while the gap to train
+loss stayed comparable. The locality prior encoded by the mask is simply
+correct for this task, and a correct hard constraint beats a soft one the model
+has to discover and maintain.
 
-1. **The locality prior is correct for this task, and 400 steps is short.**
-   Next-character prediction on Shakespeare is dominated by the last few
-   tokens: spelling, the current word, the speaker tag two lines up. The dense
-   model has to *learn* to ignore distant tokens; the windowed model gets that
-   for free from its mask. Under a short budget, a correct hard-coded prior
-   beats a soft one that still has to be discovered. I would expect dense to
-   catch up and pass at convergence, and the ordering here should be read as a
-   statement about optimisation speed, not about model quality.
+The ordering across patterns is consistent with that reading: the sparsest
+pattern wins outright, and BigBird and dilated land within 0.0001 of each other
+at similar densities. Whatever is helping scales with how much attention is
+removed, not with which long-range structure the pattern adds — which is
+another way of saying the long-range capacity is dead weight on this task.
 
-2. **Regularisation.** Removing 67 % of the attention edges is a strong
-   structural constraint on a 437 K-parameter model, and val loss is what
-   improved. The train/val gaps in `results/quality.csv` are consistent with
-   this: sparse models have slightly *higher* train loss relative to their val
-   loss than dense does.
-
-3. **Ordering across patterns is itself informative.** The ranking is
-   window < mixed < BigBird < dilated < dense. The sparsest pattern wins and the
-   pattern with holes in its local coverage (dilated, which trades local density
-   for reach) does worst of the sparse three — exactly what you would predict if
-   local coverage is what carries the signal here and long-range capacity is
-   dead weight.
-
-**The caveat that matters most.** These are single-seed runs at 400 steps and
+**The caveat that matters most.** These are single-seed runs and
 the spread is ~0.05 nats. I did not run multiple seeds, so I cannot claim the
 gaps between the *sparse* patterns are real; only the sparse-vs-dense direction
 is large enough and consistent enough across all four patterns to be worth
-anything. Do not read the 0.013 gap between dilated and dense as a measurement.
+anything. Do not read the 0.0001 gap between BigBird and dilated as a measurement.
 
 **And the deeper caveat.** Character-level LM on Shakespeare is close to the
 best possible case for a sliding window and a bad test of what sparsity
@@ -290,5 +289,6 @@ sink, arrived at from the other direction.
 * BigBird's random blocks are drawn once with a fixed seed for reproducibility;
   the paper resamples per layer, which likely matters more at depth than at 2
   layers.
-* Only tested up to 8192 on CPU with H=2. The dense curve should be pushed to
-  actual OOM on a T4 rather than stopped by a memory budget flag.
+* Tested up to 8192 on a T4, where dense still fits (8.8 GB of 15.6 GB). The
+  dense curve should be pushed to actual OOM at 16384 to show the hard wall,
+  not just the slope.
