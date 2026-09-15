@@ -120,13 +120,11 @@ Dense ×3.8 per doubling, sparse ×1.9. Peak memory at 8192: 8.8 GB dense vs
 * **Timings are relative.** Compare sparse against dense from the same run on
   the same machine. `results/hardware.json` records what that machine was.
 * **On CUDA**, peak memory comes from `torch.cuda.max_memory_allocated` and is
-  exact. **On CPU** it is a sampled RSS delta and is noisy — it occasionally
-  reads 0 when the allocator reuses pages. The `score_elems` column is the
-  hardware-independent version of the same claim: the number of attention-score
-  entries actually materialised.
-* Dense is skipped, not silently dropped, once its score matrix alone exceeds
-  `--mem-budget-gb`. That skip is a result: it is the sequence length where
-  dense stops fitting.
+  exact — that is the path every number here came from. **On CPU** it falls
+  back to a sampled RSS delta and is noisy.
+* Dense is skipped, not silently dropped, when its score matrix alone would
+  exceed `--mem-budget-gb`. On the T4 run nothing was skipped: dense reached
+  8192 at 8.8 GB of the card's 15.6 GB.
 
 ## Known limitations
 
@@ -140,3 +138,6 @@ Dense ×3.8 per doubling, sparse ×1.9. Peak memory at 8192: 8.8 GB dense vs
   handles the padded case and the harness covers it (check F).
 * Random blocks in the BigBird pattern are drawn once from a fixed seed rather
   than resampled per layer, so the pattern is reproducible and testable.
+* The correctness harness runs on CPU only, which let a device-mismatch bug in
+  the benchmark's `density()` call through until the first CUDA run.
+  Parameterising the harness over devices would have caught it.
